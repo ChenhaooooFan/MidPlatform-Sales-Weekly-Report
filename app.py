@@ -927,8 +927,8 @@ def _write_template(template_bytes, last_label, this_label,
     ws["M7"].number_format = "0.00%"
     ws["N7"].number_format = "0.00%"
 
-    # ---------------- 订单内 SKU 数量结构 ----------------
-    bucket_rows = {"1": 18, "2": 19, "3": 20, "4": 21, "4+": 22}
+    # ---------------- 订单内 SKU 数量结构 (Row 19-23, v3.1) ----------------
+    bucket_rows = {"1": 19, "2": 20, "3": 21, "4": 22, "4+": 23}
     last_bucket = last_o["bucket_struct"].set_index("bucket")["order_count"].to_dict()
     this_bucket = this_o["bucket_struct"].set_index("bucket")["order_count"].to_dict()
     last_total = sum(last_bucket.values()) or 1
@@ -942,13 +942,13 @@ def _write_template(template_bytes, last_label, this_label,
         ws.cell(row=row, column=7, value=to / this_total).number_format = "0.00%"
         ws.cell(row=row, column=8, value=round(this_o["bucket_aov"].get(b, 0), 2))
 
-    # ---------------- 退货原因 ----------------
+    # ---------------- 退货原因 (Row 19-27, v3.1) ----------------
     reason_rows_map = {
-        "No longer needed": 18, "Missing package": 19, "Wrong item was sent": 20,
-        "Item doesn't match description": 21, "Defective item": 22,
-        "Product wouldn't arrive on time": 23,
-        "Congrats on meeting your refundable sample criteria!": 24,
-        "Missing items": 25, "Damaged item or packaging": 26,
+        "No longer needed": 19, "Missing package": 20, "Wrong item was sent": 21,
+        "Item doesn't match description": 22, "Defective item": 23,
+        "Product wouldn't arrive on time": 24,
+        "Congrats on meeting your refundable sample criteria!": 25,
+        "Missing items": 26, "Damaged item or packaging": 27,
     }
     last_reason = last_r["by_reason"].set_index("reason")["qty"].to_dict() if not last_r["by_reason"].empty else {}
     this_reason = this_r["by_reason"].set_index("reason")["qty"].to_dict() if not this_r["by_reason"].empty else {}
@@ -976,35 +976,35 @@ def _write_template(template_bytes, last_label, this_label,
                 top_style = v; break
         ws.cell(row=row, column=17, value=top_style)
 
-    # ---------------- 销量 TOP 10 (B30:F39) ----------------
+    # ---------------- 销量 TOP 10 (Row 31-40, v3.1) ----------------
     for i, (_, rd) in enumerate(top10_sales.iterrows()):
-        r = 30 + i
+        r = 31 + i
         ws.cell(row=r, column=2, value=rd["style"])
         ws.cell(row=r, column=3, value=int(rd["sales"]))
         ws.cell(row=r, column=4, value=int(rd["return_qty"]))
         ws.cell(row=r, column=5, value=rd["return_rate"]).number_format = "0.00%"
         ws.cell(row=r, column=6, value="")
     for i in range(len(top10_sales), 10):
-        r = 30 + i
+        r = 31 + i
         for col in range(2, 7):
             ws.cell(row=r, column=col, value="")
 
-    # ---------------- 退货率 TOP 10 (L30:P39) ----------------
+    # ---------------- 退货率 TOP 10 (Row 31-40, v3.1) ----------------
     for i, (_, rd) in enumerate(top10_return.iterrows()):
-        r = 30 + i
+        r = 31 + i
         ws.cell(row=r, column=12, value=rd["style"])
         ws.cell(row=r, column=13, value=int(rd["sales"]))
         ws.cell(row=r, column=14, value=int(rd["return_qty"]))
         ws.cell(row=r, column=15, value=rd["return_rate"]).number_format = "0.00%"
         ws.cell(row=r, column=16, value="")
     for i in range(len(top10_return), 10):
-        r = 30 + i
+        r = 31 + i
         for col in range(12, 17):
             ws.cell(row=r, column=col, value="")
 
-    # ---------------- 🌟 近30天新品 (B43:J52) ----------------
+    # ---------------- 🌟 近30天新品 (Row 45-54, v3.1) ----------------
     for i in range(10):
-        r = 43 + i
+        r = 45 + i
         if i < len(new_products_top10):
             rd = new_products_top10.iloc[i]
             ws.cell(row=r, column=2, value=rd["style"])
@@ -1016,10 +1016,10 @@ def _write_template(template_bytes, last_label, this_label,
             for col in [2, 3, 6, 7, 10]:
                 ws.cell(row=r, column=col, value="")
 
-    # ---------------- 🚨 供应商分析 (L43:R52) ----------------
+    # ---------------- 🏭 供应商整体分析 (Row 45-54, v3.1) ----------------
     # 列：L=供应商 M=在售款数 N=有销量款数 O=总销量 P=总退货 Q=整体退货率 R=代表问题款
     for i in range(10):
-        r = 43 + i
+        r = 45 + i
         if i < len(supplier_analysis):
             rd = supplier_analysis.iloc[i]
             ws.cell(row=r, column=12, value=rd["supplier"])
@@ -1037,12 +1037,12 @@ def _write_template(template_bytes, last_label, this_label,
     # ║   新增的 5 个客诉中台 KPI 区域                              ║
     # ╚══════════════════════════════════════════════════════════════╝
 
-    # ---------------- ⏱️ 客诉响应时效 (B71:G78) ----------------
+    # ---------------- ⏱️ 客诉响应时效 (Row 64-68 + 69 中位数, v3.1) ----------------
     last_rt = response_time["last"]; this_rt = response_time["this"]
     last_rt_total = sum(last_rt["buckets"].values()) or 1
     this_rt_total = sum(this_rt["buckets"].values()) or 1
     for i, (label, _, _) in enumerate(RESPONSE_TIME_BUCKETS):
-        r = 73 + i
+        r = 64 + i
         lq = last_rt["buckets"][label]
         tq = this_rt["buckets"][label]
         ws.cell(row=r, column=3, value=lq)
@@ -1051,29 +1051,30 @@ def _write_template(template_bytes, last_label, this_label,
         ws.cell(row=r, column=6, value=tq / this_rt_total).number_format = "0.00%"
         ws.cell(row=r, column=7, value=f"=IFERROR(E{r}/C{r}-1,\"\")")
 
-    # 中位数 / 平均数（row 78）
-    ws.cell(row=78, column=3, value=f"{last_rt['median']:.1f}h / {last_rt['mean']:.1f}h"
+    # 中位数 / 平均数（Row 69, v3.1）
+    ws.cell(row=69, column=3, value=f"{last_rt['median']:.1f}h / {last_rt['mean']:.1f}h"
             if last_rt["n"] else "—")
-    ws.cell(row=78, column=5, value=f"{this_rt['median']:.1f}h / {this_rt['mean']:.1f}h"
+    ws.cell(row=69, column=5, value=f"{this_rt['median']:.1f}h / {this_rt['mean']:.1f}h"
             if this_rt["n"] else "—")
 
-    # ---------------- 🔁 重复退货买家 (B82:G91) ----------------
+    # ---------------- 🔁 重复退货买家 (Row 64-73, v3.1) ----------------
     for i in range(10):
-        r = 82 + i
+        r = 64 + i
         if i < len(repeat_buyers):
             rd = repeat_buyers.iloc[i]
-            ws.cell(row=r, column=3, value=rd["buyer"])
-            ws.cell(row=r, column=4, value=int(rd["return_count"]))
-            ws.cell(row=r, column=5, value=float(rd["amount"]))
-            ws.cell(row=r, column=6, value=str(rd["main_reason"])[:30])
-            ws.cell(row=r, column=7, value=rd["suggestion"])
+            ws.cell(row=r, column=13, value=rd["buyer"])           # M=买家
+            ws.cell(row=r, column=14, value=int(rd["return_count"]))  # N=次数
+            ws.cell(row=r, column=15, value=float(rd["amount"]))      # O=金额
+            ws.cell(row=r, column=16, value=str(rd["main_reason"])[:30])  # P=原因
+            ws.cell(row=r, column=18, value=rd["suggestion"])          # R=建议
         else:
-            for col in range(3, 8):
+            for col in [13, 14, 15, 16, 18]:
                 ws.cell(row=r, column=col, value="")
 
-    # ---------------- 💬 差评关键词 (B95:G104) ----------------
+    # ---------------- 💬 差评关键词 (Row 77-86, v3.1) ----------------
+    # 关键词在左半边：B=#（已有占位）, C=关键词, D=次数, E=占比, F=关联款式
     for i in range(10):
-        r = 95 + i
+        r = 77 + i
         if i < len(keywords):
             rd = keywords.iloc[i]
             ws.cell(row=r, column=3, value=rd["keyword"])
@@ -1084,27 +1085,30 @@ def _write_template(template_bytes, last_label, this_label,
             for col in range(3, 7):
                 ws.cell(row=r, column=col, value="")
 
-    # ---------------- 📦 包裹丢失 (B108:G108, B112:G116) ----------------
-    ws.cell(row=108, column=2, value=missing_package["last_qty"])
-    ws.cell(row=108, column=3, value=missing_package["this_qty"])
-    ws.cell(row=108, column=4, value=missing_package["wow"]).number_format = "0.00%"
-    ws.cell(row=108, column=5, value=missing_package["this_ratio"]).number_format = "0.00%"
+    # ---------------- 📦 包裹丢失 (Row 77 总览 + Row 80-84 高发款, v3.1) ----------------
+    # 总览在右半边 Row 77：L=上周丢包  M=本周丢包  N=WoW%  O=本周占比  P=上周占比
+    ws.cell(row=77, column=12, value=missing_package["last_qty"])
+    ws.cell(row=77, column=13, value=missing_package["this_qty"])
+    ws.cell(row=77, column=14, value=missing_package["wow"]).number_format = "0.00%"
+    ws.cell(row=77, column=15, value=missing_package["this_ratio"]).number_format = "0.00%"
+    ws.cell(row=77, column=16, value=missing_package["last_ratio"]).number_format = "0.00%"
 
+    # 高发款 Row 80-84：L=#（已占位）, M=款式, N=SKU, O=丢包次数, P=占该款销量比
     for i in range(5):
-        r = 112 + i
+        r = 80 + i
         if i < len(missing_package["top_styles"]):
             rd = missing_package["top_styles"].iloc[i]
-            ws.cell(row=r, column=3, value=rd["style"])
-            ws.cell(row=r, column=4, value=rd["sku"])
-            ws.cell(row=r, column=5, value=int(rd["missing_count"]))
-            ws.cell(row=r, column=6, value="—")  # 占该款销量比，简化
+            ws.cell(row=r, column=13, value=rd["style"])
+            ws.cell(row=r, column=14, value=rd["sku"])
+            ws.cell(row=r, column=15, value=int(rd["missing_count"]))
+            ws.cell(row=r, column=16, value="—")
         else:
-            for col in range(3, 7):
+            for col in range(13, 17):
                 ws.cell(row=r, column=col, value="")
 
-    # ---------------- 📈 产品生命周期 (B120:F124) ----------------
+    # ---------------- 📈 产品生命周期 (Row 90-93 + 94 合计, v3.1) ----------------
     for i in range(4):
-        r = 120 + i
+        r = 90 + i
         if i < len(lifecycle):
             rd = lifecycle.iloc[i]
             ws.cell(row=r, column=3, value=int(rd["active_count"]))
@@ -1115,14 +1119,7 @@ def _write_template(template_bytes, last_label, this_label,
             for col in range(3, 7):
                 ws.cell(row=r, column=col, value="")
 
-    # 合计行 (row 124)
-    if not lifecycle.empty:
-        ws.cell(row=124, column=3, value=int(lifecycle["active_count"].sum()))
-        ws.cell(row=124, column=4, value=int(lifecycle["sales"].sum()))
-        ws.cell(row=124, column=5, value=int(lifecycle["return_qty"].sum()))
-        total_rate = (lifecycle["return_qty"].sum() / lifecycle["sales"].sum()
-                       if lifecycle["sales"].sum() > 0 else 0)
-        ws.cell(row=124, column=6, value=total_rate).number_format = "0.00%"
+    # 生命周期合计行 (Row 94, 公式已在模板里)
 
     # ---------------- 输出 ----------------
     out = io.BytesIO()
