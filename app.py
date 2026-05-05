@@ -316,11 +316,21 @@ def split_time_windows(orders_df: pd.DataFrame, returns_df: pd.DataFrame,
         raise ValueError(span_check["message"])
 
     if mode == "halve":
-        midpoint = t_min + (t_max - t_min) / 2
-        last_start, last_end = t_min, midpoint
-        this_start, this_end = midpoint, t_max + timedelta(seconds=1)
-        last_label = f"{last_start.strftime('%-m.%-d')}-{(last_end - timedelta(days=1)).strftime('%-m.%-d')}"
-        this_label = f"{this_start.strftime('%-m.%-d')}-{t_max.strftime('%-m.%-d')}"
+        # 按整天切分（不再按时间戳）
+        # 数据范围：t_min 当天 00:00 到 t_max 当天 23:59
+        # 总天数 = (t_max.date - t_min.date).days + 1
+        # 上周 = 前一半天，本周 = 后一半天（如果天数为奇数，本周多 1 天）
+        total_days = (t_max.date() - t_min.date()).days + 1
+        last_days = total_days // 2
+        this_days = total_days - last_days
+
+        last_start = pd.Timestamp(t_min.date())  # 上周第一天 00:00
+        last_end = pd.Timestamp(t_min.date() + timedelta(days=last_days)) - timedelta(seconds=1)  # 上周最后一天 23:59:59
+        this_start = pd.Timestamp(t_min.date() + timedelta(days=last_days))  # 本周第一天 00:00
+        this_end = pd.Timestamp(t_max.date() + timedelta(days=1)) - timedelta(seconds=1)  # 本周最后一天 23:59:59
+
+        last_label = f"{last_start.strftime('%-m.%-d')}-{last_end.strftime('%-m.%-d')}"
+        this_label = f"{this_start.strftime('%-m.%-d')}-{this_end.strftime('%-m.%-d')}"
 
     elif mode == "weekly":
         if t_max.weekday() != 6:
@@ -570,6 +580,63 @@ def process_returns(df: pd.DataFrame, exclude_request_canceled: bool = True) -> 
 # ╔════════════════════════════════════════════════════════════════════╗
 # ║   第 7 部分：新品 + 供应商分析                                     ║
 # ╚════════════════════════════════════════════════════════════════════╝
+
+def build_daily_trend(orders_df: pd.DataFrame, returns_df: pd.DataFrame,
+                       t_min, t_max, influencer_col: str) -> pd.DataFrame:
+    """
+    按日聚合销售 + 退货数据，用于趋势折线图。
+    输出列：date | sales | returns | return_rate | gmv
+    """
+    from datetime import timedelta as _td
+    # 生成所有日期（覆盖整个数据范围）
+    all_days = pd.date_range(start=t_min.date(), end=t_max.date(), freq='D')
+    daily = pd.DataFrame({"date": all_days})
+
+    # 销售：剔除达人单 + 已取消单
+    if not orders_df.empty and "Created Time" in orders_df.columns:
+        o = orders_df.copy()
+        o["__t"] = pd.to_datetime(_clean_tab_str(o["Created Time"]), errors="coerce")
+        for col in ["SKU Subtotal After Discount", "Quantity"]:
+            if col in o.columns:
+                o[col] = pd.to_numeric(o[col], errors="coerce").fillna(0)
+        if influencer_col in o.columns:
+            o = o[o[influencer_col] != 0].copy()  # 排除达人单
+        if "Order Status" in o.columns:
+            o = o[o["Order Status"] != "Canceled"].copy()
+        o["__date"] = o["__t"].dt.date
+        sales_daily = o.groupby("__date").agg(
+            sales=("Quantity", "sum"),
+            gmv=("SKU Subtotal After Discount", "sum"),
+        ).reset_index().rename(columns={"__date": "date"})
+        sales_daily["date"] = pd.to_datetime(sales_daily["date"])
+        daily = daily.merge(sales_daily, on="date", how="left").fillna({"sales": 0, "gmv": 0})
+    else:
+        daily["sales"] = 0
+        daily["gmv"] = 0
+
+    # 退货：用 raw_actual（已剔除 Request Canceled）
+    if not returns_df.empty and "__t" in returns_df.columns:
+        r = returns_df.copy()
+        qty_col = _find_col(r, RETURN_COL_CANDIDATES["qty"])
+        if qty_col:
+            r[qty_col] = pd.to_numeric(r[qty_col], errors="coerce").fillna(0)
+            r["__date"] = r["__t"].dt.date
+            ret_daily = r.groupby("__date")[qty_col].sum().rename("returns").reset_index()
+            ret_daily["date"] = pd.to_datetime(ret_daily["__date"])
+            daily = daily.merge(ret_daily[["date", "returns"]], on="date", how="left").fillna({"returns": 0})
+        else:
+            daily["returns"] = 0
+    else:
+        daily["returns"] = 0
+
+    daily["return_rate"] = daily.apply(
+        lambda r: r["returns"] / r["sales"] if r["sales"] > 0 else 0, axis=1
+    )
+    daily["sales"] = daily["sales"].astype(int)
+    daily["returns"] = daily["returns"].astype(int)
+    daily["gmv"] = daily["gmv"].round(2)
+    return daily
+
 
 def build_new_products_top10(this_orders: dict, this_returns: dict,
                               catalog: pd.DataFrame, ref_date: datetime) -> pd.DataFrame:
@@ -960,7 +1027,7 @@ def _write_template(template_bytes, last_label, this_label,
                     new_products_top10, supplier_analysis,
                     response_time, repeat_buyers, keywords,
                     missing_package, lifecycle,
-                    traffic_metrics) -> bytes:
+                    traffic_metrics, daily_trend=None) -> bytes:
     """把所有指标写到模板的副本里。"""
     wb = load_workbook(io.BytesIO(template_bytes))
 
@@ -1016,19 +1083,22 @@ def _write_template(template_bytes, last_label, this_label,
     ws["M7"].number_format = "0.00%"
     ws["N7"].number_format = "0.00%"
 
-    # ---------------- 订单内 SKU 数量结构 (Row 19-23, v3.1) ----------------
+    # ---------------- 订单内 SKU 数量结构 (Row 19-23, v3.2) ----------------
+    # 占比列用 Excel 公式 = 当前订单数 / 总和（写小数 + format 0.0% 可能在某些版本被渲染为空白，公式更稳）
     bucket_rows = {"1": 19, "2": 20, "3": 21, "4": 22, "4+": 23}
     last_bucket = last_o["bucket_struct"].set_index("bucket")["order_count"].to_dict()
     this_bucket = this_o["bucket_struct"].set_index("bucket")["order_count"].to_dict()
-    last_total = sum(last_bucket.values()) or 1
-    this_total = sum(this_bucket.values()) or 1
     for b, row in bucket_rows.items():
         lo = last_bucket.get(b, 0); to = this_bucket.get(b, 0)
-        ws.cell(row=row, column=3, value=lo)
-        ws.cell(row=row, column=4, value=lo / last_total).number_format = "0.00%"
+        # C=上周订单数, D=上周占比(公式), E=上周AOV
+        c_last = ws.cell(row=row, column=3, value=lo)
+        c_last_pct = ws.cell(row=row, column=4, value=f"=IFERROR(C{row}/SUM(C$19:C$23),0)")
+        c_last_pct.number_format = "0.0%"
         ws.cell(row=row, column=5, value=round(last_o["bucket_aov"].get(b, 0), 2))
+        # F=本周订单数, G=本周占比(公式), H=本周AOV
         ws.cell(row=row, column=6, value=to)
-        ws.cell(row=row, column=7, value=to / this_total).number_format = "0.00%"
+        c_this_pct = ws.cell(row=row, column=7, value=f"=IFERROR(F{row}/SUM(F$19:F$23),0)")
+        c_this_pct.number_format = "0.0%"
         ws.cell(row=row, column=8, value=round(this_o["bucket_aov"].get(b, 0), 2))
 
     # ---------------- 退货原因 (Row 19-27, v3.1) ----------------
@@ -1056,9 +1126,13 @@ def _write_template(template_bytes, last_label, this_label,
         tq = _match_reason(reason, this_reason)
         ws.cell(row=row, column=12, value=reason)
         ws.cell(row=row, column=13, value=lq)
-        ws.cell(row=row, column=14, value=lq / last_reason_total).number_format = "0.00%"
+        # N 列：上周占比公式
+        c14 = ws.cell(row=row, column=14, value=f"=IFERROR(M{row}/SUM(M$19:M$27),0)")
+        c14.number_format = "0.0%"
         ws.cell(row=row, column=15, value=tq)
-        ws.cell(row=row, column=16, value=tq / this_reason_total).number_format = "0.00%"
+        # P 列：本周占比公式
+        c16 = ws.cell(row=row, column=16, value=f"=IFERROR(O{row}/SUM(O$19:O$27),0)")
+        c16.number_format = "0.0%"
         top_style = ""
         for k, v in this_r["by_reason_top_style"].items():
             if reason.lower() in str(k).lower() or str(k).lower() in reason.lower():
@@ -1160,7 +1234,7 @@ def _write_template(template_bytes, last_label, this_label,
             for col in [13, 14, 15, 16, 18]:
                 ws.cell(row=r, column=col, value="")
 
-    # ---------------- 📦 包裹丢失 (v3.2: 左侧 B-G, 总览 Row 77, 高发款 Row 80-84) ----------------
+    # ---------------- 📦 包裹丢失 (v3.3: 仅总览，删了高发款 TOP 5) ----------------
     # 总览 Row 77: B=上周丢包  C=本周丢包  D=WoW%  E=本周占比  F=上周占比
     ws.cell(row=77, column=2, value=missing_package["last_qty"])
     ws.cell(row=77, column=3, value=missing_package["this_qty"])
@@ -1168,28 +1242,15 @@ def _write_template(template_bytes, last_label, this_label,
     ws.cell(row=77, column=5, value=missing_package["this_ratio"]).number_format = "0.00%"
     ws.cell(row=77, column=6, value=missing_package["last_ratio"]).number_format = "0.00%"
 
-    # 高发款 Row 80-84: B=#（已占位）, C=款式, D=SKU, E=丢包次数, F=占该款销量比
-    for i in range(5):
-        r = 80 + i
-        if i < len(missing_package["top_styles"]):
-            rd = missing_package["top_styles"].iloc[i]
-            ws.cell(row=r, column=3, value=rd["style"])
-            ws.cell(row=r, column=4, value=rd["sku"])
-            ws.cell(row=r, column=5, value=int(rd["missing_count"]))
-            ws.cell(row=r, column=6, value="—")
-        else:
-            for col in range(3, 7):
-                ws.cell(row=r, column=col, value="")
-
-    # ---------------- 📈 产品生命周期 (v3.2: 右侧 L-P, Row 77-80, 合计 Row 81) ----------------
+    # ---------------- 📈 产品生命周期 (Row 77-80, 合计 Row 81) ----------------
     for i in range(4):
         r = 77 + i
         if i < len(lifecycle):
             rd = lifecycle.iloc[i]
-            ws.cell(row=r, column=13, value=int(rd["active_count"]))   # M=在售款数
-            ws.cell(row=r, column=14, value=int(rd["sales"]))           # N=本周销量
-            ws.cell(row=r, column=15, value=int(rd["return_qty"]))      # O=本周退货
-            ws.cell(row=r, column=16, value=rd["return_rate"]).number_format = "0.00%"  # P=退货率
+            ws.cell(row=r, column=13, value=int(rd["active_count"]))
+            ws.cell(row=r, column=14, value=int(rd["sales"]))
+            ws.cell(row=r, column=15, value=int(rd["return_qty"]))
+            ws.cell(row=r, column=16, value=rd["return_rate"]).number_format = "0.00%"
         else:
             for col in range(13, 17):
                 ws.cell(row=r, column=col, value="")
@@ -1285,6 +1346,87 @@ def _write_template(template_bytes, last_label, this_label,
     c10.width = 16; c10.height = 9
     _add_chart(c10, 'L175')
 
+    # ---------------- 日趋势数据（写到 Row 200+，作图用，行高极小相当于隐藏） ----------------
+    if daily_trend is not None and not daily_trend.empty:
+        # 数据区起始 Row 200
+        DAILY_START = 200
+        # 表头
+        ws.cell(row=DAILY_START, column=2, value='日期')
+        ws.cell(row=DAILY_START, column=3, value='销量')
+        ws.cell(row=DAILY_START, column=4, value='退货量')
+        ws.cell(row=DAILY_START, column=5, value='退货率')
+        ws.cell(row=DAILY_START, column=6, value='GMV')
+        # 数据
+        for i, (_, row_data) in enumerate(daily_trend.iterrows()):
+            r = DAILY_START + 1 + i
+            ws.cell(row=r, column=2, value=row_data["date"]).number_format = 'mm-dd'
+            ws.cell(row=r, column=3, value=int(row_data["sales"]))
+            ws.cell(row=r, column=4, value=int(row_data["returns"]))
+            ws.cell(row=r, column=5, value=float(row_data["return_rate"])).number_format = '0.0%'
+            ws.cell(row=r, column=6, value=float(row_data["gmv"])).number_format = '$#,##0'
+
+        n_days = len(daily_trend)
+        last_data_row = DAILY_START + n_days
+
+        # 图 11: 每日销量趋势（折线）
+        from openpyxl.chart import LineChart
+        c11 = LineChart()
+        c11.title = '每日销量趋势'
+        c11.y_axis.title = '销量'
+        c11.x_axis.title = '日期'
+        c11.add_data(Reference(ws, min_col=3, min_row=DAILY_START, max_row=last_data_row, max_col=3),
+                      titles_from_data=True)
+        c11.set_categories(Reference(ws, min_col=2, min_row=DAILY_START + 1, max_row=last_data_row))
+        c11.width = 16; c11.height = 9
+        c11.legend = None
+        _add_chart(c11, 'B196')
+
+        # 图 12: 每日退货量趋势（折线）
+        c12 = LineChart()
+        c12.title = '每日退货量趋势'
+        c12.y_axis.title = '退货量'
+        c12.x_axis.title = '日期'
+        c12.add_data(Reference(ws, min_col=4, min_row=DAILY_START, max_row=last_data_row, max_col=4),
+                      titles_from_data=True)
+        c12.set_categories(Reference(ws, min_col=2, min_row=DAILY_START + 1, max_row=last_data_row))
+        c12.width = 16; c12.height = 9
+        c12.legend = None
+        _add_chart(c12, 'L196')
+
+        # 图 13: 每日退货率趋势（折线）
+        c13 = LineChart()
+        c13.title = '每日退货率趋势'
+        c13.y_axis.title = '退货率'
+        c13.x_axis.title = '日期'
+        c13.y_axis.number_format = '0.0%'
+        c13.add_data(Reference(ws, min_col=5, min_row=DAILY_START, max_row=last_data_row, max_col=5),
+                      titles_from_data=True)
+        c13.set_categories(Reference(ws, min_col=2, min_row=DAILY_START + 1, max_row=last_data_row))
+        c13.width = 16; c13.height = 9
+        c13.legend = None
+        _add_chart(c13, 'B217')
+
+        # 图 14: 每日 GMV 趋势（柱状）
+        c14_chart = BarChart(); c14_chart.type = 'col'; c14_chart.style = 12
+        c14_chart.title = '每日 GMV 趋势'
+        c14_chart.y_axis.title = 'GMV ($)'
+        c14_chart.add_data(Reference(ws, min_col=6, min_row=DAILY_START, max_row=last_data_row, max_col=6),
+                            titles_from_data=True)
+        c14_chart.set_categories(Reference(ws, min_col=2, min_row=DAILY_START + 1, max_row=last_data_row))
+        c14_chart.width = 16; c14_chart.height = 9
+        c14_chart.legend = None
+        _add_chart(c14_chart, 'L217')
+
+    # 图 15: 重复退货次数分布（柱状）
+    c15 = BarChart(); c15.type = 'col'; c15.style = 11
+    c15.title = '重复退货买家次数分布'
+    c15.y_axis.title = '退货次数'
+    c15.add_data(Reference(ws, min_col=14, min_row=63, max_row=73, max_col=14), titles_from_data=True)
+    c15.set_categories(Reference(ws, min_col=13, min_row=64, max_row=73))
+    c15.width = 16; c15.height = 9
+    c15.legend = None
+    _add_chart(c15, 'B238')
+
     # ---------------- 输出 ----------------
     out = io.BytesIO()
     wb.save(out)
@@ -1353,6 +1495,15 @@ def build_report(orders_file, returns_file, catalog_file,
     missing_pkg = build_missing_package_analysis(last_r, this_r, catalog)
     lifecycle = build_lifecycle_analysis(this_o, this_r, catalog, windows["ref_date"])
 
+    # 日趋势（用整段 28 天数据，不切上下周）
+    daily_trend = build_daily_trend(
+        orders_df=orders_df,
+        returns_df=returns_df,
+        t_min=windows["t_min"],
+        t_max=windows["t_max"],
+        influencer_col=influencer_col,
+    )
+
     # 写模板
     output_bytes = _write_template(
         template_bytes=template_bytes,
@@ -1367,6 +1518,7 @@ def build_report(orders_file, returns_file, catalog_file,
         missing_package=missing_pkg,
         lifecycle=lifecycle,
         traffic_metrics=traffic_metrics,
+        daily_trend=daily_trend,
     )
 
     # 摘要
@@ -1475,23 +1627,44 @@ with st.sidebar:
         "atc_this":       st.text_input("本周 Add-To-Cart (%)"),
     }
 
-st.subheader("📂 上传 3 个文件")
-col1, col2, col3 = st.columns(3)
-with col1:
-    st.markdown("**1. 订单（28天）**")
-    orders_file = st.file_uploader("All_order csv/xlsx", type=["csv", "xlsx"], key="orders")
-with col2:
-    st.markdown("**2. 退货（28天）**")
-    returns_file = st.file_uploader("Return_Refund_Orders xlsx", type=["csv", "xlsx"], key="returns")
-with col3:
-    st.markdown("**3. 产品图册**")
-    DEFAULT_CATALOG = Path(__file__).parent / "NailVesta_产品图册.csv"
-    catalog_file = st.file_uploader("NailVesta_产品图册（不传用默认）",
-                                     type=["csv", "xlsx"], key="catalog")
-
+DEFAULT_CATALOG = Path(__file__).parent / "NailVesta_产品图册.csv"
 DEFAULT_TEMPLATE = Path(__file__).parent / "NailVesta_中台运营周报_模板.xlsx"
-with st.expander("（可选）自定义周报模板"):
-    template_file = st.file_uploader("上传自定义模板", type=["xlsx"], key="template")
+
+st.subheader("📂 上传 TikTok Shop 数据")
+st.caption("💡 产品图册和周报模板已内置在程序里，**只需要上传订单和退货** 2 个文件 ✨")
+col1, col2 = st.columns(2)
+with col1:
+    st.markdown("**1. 订单数据（最近 28 天）**")
+    orders_file = st.file_uploader(
+        "All_order csv/xlsx",
+        type=["csv", "xlsx"], key="orders",
+        help="TikTok Shop 后台 → 订单 → 导出最近 28 天数据"
+    )
+with col2:
+    st.markdown("**2. 退货数据（最近 28 天）**")
+    returns_file = st.file_uploader(
+        "Return_Refund_Orders xlsx",
+        type=["csv", "xlsx"], key="returns",
+        help="TikTok Shop 后台 → 退货退款 → 导出最近 28 天数据"
+    )
+
+# 高级选项（默认折叠）：替换内置图册或模板
+with st.expander("🔧 高级选项（一般不用动）"):
+    st.caption("以下文件已内置在程序里，只在需要更新时上传新版本")
+    adv_col1, adv_col2 = st.columns(2)
+    with adv_col1:
+        st.markdown("**产品图册**")
+        if DEFAULT_CATALOG.exists():
+            st.success(f"✓ 内置图册：{DEFAULT_CATALOG.name}")
+        catalog_file = st.file_uploader("替换图册（可选）",
+                                         type=["csv", "xlsx"], key="catalog",
+                                         label_visibility="collapsed")
+    with adv_col2:
+        st.markdown("**周报模板**")
+        if DEFAULT_TEMPLATE.exists():
+            st.success(f"✓ 内置模板：{DEFAULT_TEMPLATE.name}")
+        template_file = st.file_uploader("替换模板（可选）", type=["xlsx"], key="template",
+                                          label_visibility="collapsed")
 
 # -------- 预检：上传订单后立刻显示数据范围 + 预估切分 --------
 if orders_file is not None:
@@ -1514,11 +1687,10 @@ if orders_file is not None:
                         _check["message"]
                     )
                 else:
-                    # 计算实际切分
+                    # 计算实际切分（按整天）
                     if time_window_mode == "halve":
-                        _mid = _tmin + (_tmax - _tmin) / 2
-                        _last_d = (_mid - _tmin).days
-                        _this_d = (_tmax - _mid).days + 1
+                        _last_d = _days // 2
+                        _this_d = _days - _last_d
                         _split_text = f"将切分为：上周 {_last_d} 天 vs 本周 {_this_d} 天"
                     else:
                         _split_text = "将取最近 2 个完整自然周对比"
@@ -1677,12 +1849,8 @@ if st.button("🚀 生成周报", type="primary", use_container_width=True):
                f"{mp['wow']:+.1%}", delta_color="inverse")
     mpc.metric("占总退货比", f"{mp['this_ratio']:.1%}")
     mpd.metric("上周占比", f"{mp['last_ratio']:.1%}")
-    if not mp["top_styles"].empty:
-        st.markdown("**高发丢包款式 TOP 5**")
-        st.dataframe(mp["top_styles"][["style", "sku", "missing_count"]],
-                     use_container_width=True, hide_index=True)
 
-    # 5. 生命周期
+    # 4. 生命周期
     st.subheader("📈 产品生命周期退货率")
     if not summary["lifecycle"].empty:
         st.dataframe(summary["lifecycle"], use_container_width=True, hide_index=True)
