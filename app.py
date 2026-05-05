@@ -196,9 +196,94 @@ def _clean_tab_str(s: pd.Series) -> pd.Series:
 # ║   第 3 部分：时间窗拆分                                            ║
 # ╚════════════════════════════════════════════════════════════════════╝
 
+# 数据时长安全阈值
+MIN_DAYS_REQUIRED = 14   # 少于这么多天，没法做有意义的双周对比
+IDEAL_DAYS_LOW    = 21   # 理想下限
+IDEAL_DAYS_HIGH   = 35   # 理想上限
+HARD_MAX_DAYS     = 60   # 超过这么多天，直接拒绝（数据陈旧）
+
+
+def check_data_span(t_min, t_max, mode: str) -> dict:
+    """
+    检测数据时长是否合理，返回 {ok, level, message, days}
+    level: 'ok' | 'warning' | 'error'
+    """
+    days = (t_max - t_min).days + 1
+
+    # 太少 → 直接报错
+    if days < MIN_DAYS_REQUIRED:
+        return {
+            "ok": False, "level": "error", "days": days,
+            "message": (
+                f"❌ 数据范围只有 {days} 天（{t_min.date()} ~ {t_max.date()}），"
+                f"无法做有意义的双周对比。\n\n"
+                f"周报至少需要 {MIN_DAYS_REQUIRED} 天数据。"
+                f"建议导出 TikTok Shop 后台的最近 28 天订单 + 退货数据后重试。"
+            ),
+        }
+
+    # 自然周模式特别检查：能否找到完整的两个自然周
+    if mode == "weekly":
+        # 找最近的完整自然周末（周日）
+        if t_max.weekday() != 6:
+            this_end = t_max - timedelta(days=t_max.weekday() + 1)
+        else:
+            this_end = t_max
+        this_start = this_end - timedelta(days=6)
+        last_start = this_start - timedelta(days=7)
+
+        if last_start.date() < t_min.date():
+            return {
+                "ok": False, "level": "error", "days": days,
+                "message": (
+                    f"❌ 自然周对比模式需要至少 2 个完整自然周的数据。\n\n"
+                    f"当前数据：{t_min.date()} ~ {t_max.date()}（{days} 天）\n"
+                    f"需要：{last_start.date()} 之前还要有数据\n\n"
+                    f"建议：要么换成「28天对半切」模式，要么补充更早的数据"
+                ),
+            }
+
+    # 太多 → 警告
+    if days > HARD_MAX_DAYS:
+        return {
+            "ok": False, "level": "error", "days": days,
+            "message": (
+                f"❌ 数据范围 {days} 天太长（{t_min.date()} ~ {t_max.date()}），"
+                f"超过 {HARD_MAX_DAYS} 天会让对比失去意义。\n\n"
+                f"建议导出最近 28 天数据，旧数据看历史 sheet 即可。"
+            ),
+        }
+
+    # 偏离理想范围 → 警告但允许继续
+    if days < IDEAL_DAYS_LOW:
+        if mode == "halve":
+            half = days // 2
+            return {
+                "ok": True, "level": "warning", "days": days,
+                "message": (
+                    f"⚠️ 数据范围 {days} 天偏少，对半切后将变成 {half} 天 vs {days - half} 天对比，"
+                    f"可能样本不足。建议使用 28 天数据。"
+                ),
+            }
+    elif days > IDEAL_DAYS_HIGH:
+        if mode == "halve":
+            half = days // 2
+            return {
+                "ok": True, "level": "warning", "days": days,
+                "message": (
+                    f"⚠️ 数据范围 {days} 天偏多，对半切后变成 {half} 天 vs {days - half} 天，"
+                    f"已偏离「周对比」语义。如果想要纯粹的周报，建议使用最近 28 天数据，"
+                    f"或换成「自然周对比」模式。"
+                ),
+            }
+
+    # 完美
+    return {"ok": True, "level": "ok", "days": days, "message": ""}
+
+
 def split_time_windows(orders_df: pd.DataFrame, returns_df: pd.DataFrame,
                        mode: str) -> dict:
-    """将 28 天数据拆为「上周/本周」"""
+    """将数据拆为「上周/本周」"""
     if orders_df.empty:
         raise ValueError("订单数据为空")
 
@@ -224,6 +309,11 @@ def split_time_windows(orders_df: pd.DataFrame, returns_df: pd.DataFrame,
     t_max = o["__t"].max()
     if pd.isna(t_min) or pd.isna(t_max):
         raise ValueError("订单时间字段无法解析")
+
+    # 数据时长校验
+    span_check = check_data_span(t_min, t_max, mode)
+    if not span_check["ok"]:
+        raise ValueError(span_check["message"])
 
     if mode == "halve":
         midpoint = t_min + (t_max - t_min) / 2
@@ -262,6 +352,9 @@ def split_time_windows(orders_df: pd.DataFrame, returns_df: pd.DataFrame,
         "last_returns": last_returns, "this_returns": this_returns,
         "last_label": last_label, "this_label": this_label,
         "ref_date": t_max, "t_min": t_min, "t_max": t_max,
+        "span_check": span_check,
+        "last_start": last_start, "last_end": last_end,
+        "this_start": this_start, "this_end": this_end,
     }
 
 
@@ -883,21 +976,17 @@ def _write_template(template_bytes, last_label, this_label,
     # ---------------- B2 标题 ----------------
     ws["B2"] = f"NailVesta 中台运营周报  |  Week：{this_label}"
 
-    # ---------------- 核心指标区 ----------------
+    # ---------------- 核心指标区 (v3.2: 5 列布局, B=指标 C=上周 D=本周 E=WoW%) ----------------
     metrics_rows_last = {6: last_o["orders"], 7: last_o["sku_sold"], 8: last_o["attach_rate"],
                           9: last_o["asp"], 10: last_o["aov"], 15: last_o["gmv"]}
     metrics_rows_this = {6: this_o["orders"], 7: this_o["sku_sold"], 8: this_o["attach_rate"],
                           9: this_o["asp"], 10: this_o["aov"], 15: this_o["gmv"]}
     for row, last_v in metrics_rows_last.items():
-        ws.cell(row=row, column=3, value=last_v)
-        ws.cell(row=row, column=6, value=metrics_rows_this[row])
-        ws.cell(row=row, column=7, value=f"=IFERROR(F{row}/C{row}-1,\"\")")
-    ws["D6"] = last_o["influencer_orders"]
-    ws["E6"] = this_o["influencer_orders"]
-    ws["D7"] = ""
-    ws["E7"] = ""
+        ws.cell(row=row, column=3, value=last_v)            # C=上周
+        ws.cell(row=row, column=4, value=metrics_rows_this[row])  # D=本周
+        # E=WoW% 公式（注意：模板里已经写了 =IFERROR(D/C-1)，这里跳过避免重写损失格式）
 
-    # 流量指标
+    # 流量指标（11-14 行）
     flow_map = {11: ("ctr_last", "ctr_this"), 12: ("cvr_last", "cvr_this"),
                 13: ("cart_conv_last", "cart_conv_this"), 14: ("atc_last", "atc_this")}
     for row, (lk, tk) in flow_map.items():
@@ -906,7 +995,7 @@ def _write_template(template_bytes, last_label, this_label,
         if lv is not None:
             ws.cell(row=row, column=3, value=lv).number_format = "0.00%"
         if tv is not None:
-            ws.cell(row=row, column=6, value=tv).number_format = "0.00%"
+            ws.cell(row=row, column=4, value=tv).number_format = "0.00%"
 
     # ---------------- 退换货总览 ----------------
     rr_last = last_r["total_qty"] / last_o["sku_sold"] if last_o["sku_sold"] else 0
@@ -1071,55 +1160,130 @@ def _write_template(template_bytes, last_label, this_label,
             for col in [13, 14, 15, 16, 18]:
                 ws.cell(row=r, column=col, value="")
 
-    # ---------------- 💬 差评关键词 (Row 77-86, v3.1) ----------------
-    # 关键词在左半边：B=#（已有占位）, C=关键词, D=次数, E=占比, F=关联款式
-    for i in range(10):
-        r = 77 + i
-        if i < len(keywords):
-            rd = keywords.iloc[i]
-            ws.cell(row=r, column=3, value=rd["keyword"])
-            ws.cell(row=r, column=4, value=int(rd["count"]))
-            ws.cell(row=r, column=5, value=rd["ratio"]).number_format = "0.00%"
-            ws.cell(row=r, column=6, value=str(rd["top_styles"]))
-        else:
-            for col in range(3, 7):
-                ws.cell(row=r, column=col, value="")
+    # ---------------- 📦 包裹丢失 (v3.2: 左侧 B-G, 总览 Row 77, 高发款 Row 80-84) ----------------
+    # 总览 Row 77: B=上周丢包  C=本周丢包  D=WoW%  E=本周占比  F=上周占比
+    ws.cell(row=77, column=2, value=missing_package["last_qty"])
+    ws.cell(row=77, column=3, value=missing_package["this_qty"])
+    ws.cell(row=77, column=4, value=missing_package["wow"]).number_format = "0.00%"
+    ws.cell(row=77, column=5, value=missing_package["this_ratio"]).number_format = "0.00%"
+    ws.cell(row=77, column=6, value=missing_package["last_ratio"]).number_format = "0.00%"
 
-    # ---------------- 📦 包裹丢失 (Row 77 总览 + Row 80-84 高发款, v3.1) ----------------
-    # 总览在右半边 Row 77：L=上周丢包  M=本周丢包  N=WoW%  O=本周占比  P=上周占比
-    ws.cell(row=77, column=12, value=missing_package["last_qty"])
-    ws.cell(row=77, column=13, value=missing_package["this_qty"])
-    ws.cell(row=77, column=14, value=missing_package["wow"]).number_format = "0.00%"
-    ws.cell(row=77, column=15, value=missing_package["this_ratio"]).number_format = "0.00%"
-    ws.cell(row=77, column=16, value=missing_package["last_ratio"]).number_format = "0.00%"
-
-    # 高发款 Row 80-84：L=#（已占位）, M=款式, N=SKU, O=丢包次数, P=占该款销量比
+    # 高发款 Row 80-84: B=#（已占位）, C=款式, D=SKU, E=丢包次数, F=占该款销量比
     for i in range(5):
         r = 80 + i
         if i < len(missing_package["top_styles"]):
             rd = missing_package["top_styles"].iloc[i]
-            ws.cell(row=r, column=13, value=rd["style"])
-            ws.cell(row=r, column=14, value=rd["sku"])
-            ws.cell(row=r, column=15, value=int(rd["missing_count"]))
-            ws.cell(row=r, column=16, value="—")
-        else:
-            for col in range(13, 17):
-                ws.cell(row=r, column=col, value="")
-
-    # ---------------- 📈 产品生命周期 (Row 90-93 + 94 合计, v3.1) ----------------
-    for i in range(4):
-        r = 90 + i
-        if i < len(lifecycle):
-            rd = lifecycle.iloc[i]
-            ws.cell(row=r, column=3, value=int(rd["active_count"]))
-            ws.cell(row=r, column=4, value=int(rd["sales"]))
-            ws.cell(row=r, column=5, value=int(rd["return_qty"]))
-            ws.cell(row=r, column=6, value=rd["return_rate"]).number_format = "0.00%"
+            ws.cell(row=r, column=3, value=rd["style"])
+            ws.cell(row=r, column=4, value=rd["sku"])
+            ws.cell(row=r, column=5, value=int(rd["missing_count"]))
+            ws.cell(row=r, column=6, value="—")
         else:
             for col in range(3, 7):
                 ws.cell(row=r, column=col, value="")
 
+    # ---------------- 📈 产品生命周期 (v3.2: 右侧 L-P, Row 77-80, 合计 Row 81) ----------------
+    for i in range(4):
+        r = 77 + i
+        if i < len(lifecycle):
+            rd = lifecycle.iloc[i]
+            ws.cell(row=r, column=13, value=int(rd["active_count"]))   # M=在售款数
+            ws.cell(row=r, column=14, value=int(rd["sales"]))           # N=本周销量
+            ws.cell(row=r, column=15, value=int(rd["return_qty"]))      # O=本周退货
+            ws.cell(row=r, column=16, value=rd["return_rate"]).number_format = "0.00%"  # P=退货率
+        else:
+            for col in range(13, 17):
+                ws.cell(row=r, column=col, value="")
+
     # 生命周期合计行 (Row 94, 公式已在模板里)
+
+    # ---------------- 重建图表（copy_worksheet 不会复制图表，需要手动加）----------------
+    from openpyxl.chart import BarChart, PieChart, DoughnutChart, Reference
+    from openpyxl.chart.label import DataLabelList
+
+    def _add_chart(chart, anchor):
+        ws.add_chart(chart, anchor)
+
+    # 图 1: 销量 TOP 10
+    c1 = BarChart(); c1.type = 'col'; c1.style = 12
+    c1.title = '销量 TOP 10 款式'; c1.y_axis.title = '销量'
+    c1.add_data(Reference(ws, min_col=3, min_row=30, max_row=40, max_col=3), titles_from_data=True)
+    c1.set_categories(Reference(ws, min_col=2, min_row=31, max_row=40))
+    c1.width = 16; c1.height = 9; c1.legend = None
+    _add_chart(c1, 'B91')
+
+    # 图 2: 退货率 TOP 10
+    c2 = BarChart(); c2.type = 'col'; c2.style = 11
+    c2.title = '退货率 TOP 10 款式（销量≥10）'; c2.y_axis.title = '退货率'
+    c2.add_data(Reference(ws, min_col=15, min_row=30, max_row=40, max_col=15), titles_from_data=True)
+    c2.set_categories(Reference(ws, min_col=12, min_row=31, max_row=40))
+    c2.width = 16; c2.height = 9; c2.legend = None
+    _add_chart(c2, 'L91')
+
+    # 图 3: 退货原因横向条形图
+    c3 = BarChart(); c3.type = 'bar'; c3.style = 13
+    c3.title = '退货原因分布（本周）'; c3.x_axis.title = '退货数量'
+    c3.add_data(Reference(ws, min_col=15, min_row=18, max_row=27, max_col=15), titles_from_data=True)
+    c3.set_categories(Reference(ws, min_col=12, min_row=19, max_row=27))
+    c3.width = 16; c3.height = 10; c3.legend = None
+    _add_chart(c3, 'B112')
+
+    # 图 4: 退货原因占比环形图
+    c4 = DoughnutChart(); c4.title = '退货原因占比（本周）'
+    c4.add_data(Reference(ws, min_col=15, min_row=18, max_row=27, max_col=15), titles_from_data=True)
+    c4.set_categories(Reference(ws, min_col=12, min_row=19, max_row=27))
+    c4.width = 16; c4.height = 10
+    c4.dataLabels = DataLabelList(showPercent=True)
+    _add_chart(c4, 'L112')
+
+    # 图 5: 供应商整体退货率
+    c5 = BarChart(); c5.type = 'bar'; c5.style = 14
+    c5.title = '供应商整体退货率'; c5.x_axis.title = '退货率'
+    c5.add_data(Reference(ws, min_col=17, min_row=44, max_row=54, max_col=17), titles_from_data=True)
+    c5.set_categories(Reference(ws, min_col=12, min_row=45, max_row=54))
+    c5.width = 16; c5.height = 10; c5.legend = None
+    _add_chart(c5, 'B133')
+
+    # 图 6: 客诉响应时效饼图
+    c6 = PieChart(); c6.title = '客诉响应时效分布（本周）'
+    c6.add_data(Reference(ws, min_col=5, min_row=63, max_row=68, max_col=5), titles_from_data=True)
+    c6.set_categories(Reference(ws, min_col=2, min_row=64, max_row=68))
+    c6.width = 16; c6.height = 10
+    c6.dataLabels = DataLabelList(showPercent=True)
+    _add_chart(c6, 'L133')
+
+    # 图 7: 生命周期退货率
+    c7 = BarChart(); c7.type = 'col'; c7.style = 13
+    c7.title = '产品生命周期退货率'; c7.y_axis.title = '退货率'
+    c7.add_data(Reference(ws, min_col=16, min_row=76, max_row=80, max_col=16), titles_from_data=True)
+    c7.set_categories(Reference(ws, min_col=12, min_row=77, max_row=80))
+    c7.width = 16; c7.height = 9; c7.legend = None
+    _add_chart(c7, 'B154')
+
+    # 图 8: 订单 SKU 数量结构
+    c8 = BarChart(); c8.type = 'col'; c8.style = 12
+    c8.title = '订单内 SKU 数量结构（本周）'; c8.y_axis.title = '订单数'
+    c8.add_data(Reference(ws, min_col=6, min_row=18, max_row=23, max_col=6), titles_from_data=True)
+    c8.set_categories(Reference(ws, min_col=2, min_row=19, max_row=23))
+    c8.width = 16; c8.height = 9; c8.legend = None
+    _add_chart(c8, 'L154')
+
+    # 图 9: 退货原因 上周 vs 本周对比
+    c9 = BarChart(); c9.type = 'col'; c9.style = 11
+    c9.title = '退货原因 上周 vs 本周'; c9.y_axis.title = '退货数量'
+    c9.add_data(Reference(ws, min_col=13, min_row=18, max_row=27, max_col=13), titles_from_data=True)
+    c9.add_data(Reference(ws, min_col=15, min_row=18, max_row=27, max_col=15), titles_from_data=True)
+    c9.set_categories(Reference(ws, min_col=12, min_row=19, max_row=27))
+    c9.width = 16; c9.height = 9
+    _add_chart(c9, 'B175')
+
+    # 图 10: 供应商 销量 vs 退货
+    c10 = BarChart(); c10.type = 'col'; c10.style = 12
+    c10.title = '供应商总销量 vs 总退货量'; c10.y_axis.title = '数量'
+    c10.add_data(Reference(ws, min_col=15, min_row=44, max_row=54, max_col=15), titles_from_data=True)
+    c10.add_data(Reference(ws, min_col=16, min_row=44, max_row=54, max_col=16), titles_from_data=True)
+    c10.set_categories(Reference(ws, min_col=12, min_row=45, max_row=54))
+    c10.width = 16; c10.height = 9
+    _add_chart(c10, 'L175')
 
     # ---------------- 输出 ----------------
     out = io.BytesIO()
@@ -1253,6 +1417,11 @@ def build_report(orders_file, returns_file, catalog_file,
             "t_min": windows["t_min"],
             "t_max": windows["t_max"],
             "ref_date": windows["ref_date"],
+            "last_start": windows["last_start"],
+            "last_end": windows["last_end"],
+            "this_start": windows["this_start"],
+            "this_end": windows["this_end"],
+            "span_check": windows["span_check"],
         },
     }
     return output_bytes, summary
@@ -1324,6 +1493,41 @@ DEFAULT_TEMPLATE = Path(__file__).parent / "NailVesta_中台运营周报_模板.
 with st.expander("（可选）自定义周报模板"):
     template_file = st.file_uploader("上传自定义模板", type=["xlsx"], key="template")
 
+# -------- 预检：上传订单后立刻显示数据范围 + 预估切分 --------
+if orders_file is not None:
+    try:
+        orders_file.seek(0)
+        _peek_df = _read_any(orders_file)
+        orders_file.seek(0)
+        if "Created Time" in _peek_df.columns and not _peek_df.empty:
+            _t = pd.to_datetime(_clean_tab_str(_peek_df["Created Time"]), errors="coerce")
+            _tmin, _tmax = _t.min(), _t.max()
+            if pd.notna(_tmin) and pd.notna(_tmax):
+                _days = (_tmax - _tmin).days + 1
+                _check = check_data_span(_tmin, _tmax, time_window_mode)
+
+                if _check["level"] == "error":
+                    st.error(_check["message"])
+                elif _check["level"] == "warning":
+                    st.warning(
+                        f"📅 数据范围：{_tmin.date()} ~ {_tmax.date()}（{_days} 天）\n\n" +
+                        _check["message"]
+                    )
+                else:
+                    # 计算实际切分
+                    if time_window_mode == "halve":
+                        _mid = _tmin + (_tmax - _tmin) / 2
+                        _last_d = (_mid - _tmin).days
+                        _this_d = (_tmax - _mid).days + 1
+                        _split_text = f"将切分为：上周 {_last_d} 天 vs 本周 {_this_d} 天"
+                    else:
+                        _split_text = "将取最近 2 个完整自然周对比"
+                    st.success(
+                        f"✅ 数据范围：**{_tmin.date()} ~ {_tmax.date()}**（{_days} 天）  |  {_split_text}"
+                    )
+    except Exception:
+        pass  # 预检失败不影响主流程
+
 st.divider()
 
 if st.button("🚀 生成周报", type="primary", use_container_width=True):
@@ -1370,10 +1574,19 @@ if st.button("🚀 生成周报", type="primary", use_container_width=True):
     st.success("✅ 周报已生成！")
 
     w = summary["windows"]
+    span = w.get("span_check", {})
+    days = span.get("days", 0)
+
+    # 主信息条：数据范围 + 切分窗口
     st.info(
-        f"📅 数据范围：{w['t_min'].strftime('%Y-%m-%d')} ~ {w['t_max'].strftime('%Y-%m-%d')}  "
-        f"|  上周：**{summary['last']['label']}**  vs  本周：**{summary['this']['label']}**"
+        f"📅 **数据范围**：{w['t_min'].strftime('%Y-%m-%d')} ~ {w['t_max'].strftime('%Y-%m-%d')}（共 {days} 天）  \n"
+        f"📊 **上周**（{summary['last']['label']}）：{w['last_start'].strftime('%Y-%m-%d')} ~ {w['last_end'].strftime('%Y-%m-%d')}  \n"
+        f"📊 **本周**（{summary['this']['label']}）：{w['this_start'].strftime('%Y-%m-%d')} ~ {w['this_end'].strftime('%Y-%m-%d')}"
     )
+
+    # 时长警告
+    if span.get("level") == "warning":
+        st.warning(span["message"])
 
     # 核心看板
     st.subheader("📊 核心指标")
@@ -1455,14 +1668,7 @@ if st.button("🚀 生成周报", type="primary", use_container_width=True):
     else:
         st.caption("（本周无重复退货）")
 
-    # 3. 关键词
-    st.subheader("💬 差评关键词 TOP 10（来自 Buyer Note）")
-    if not summary["keywords"].empty:
-        st.dataframe(summary["keywords"], use_container_width=True, hide_index=True)
-    else:
-        st.caption("（本周 Buyer Note 数据不足）")
-
-    # 4. 包裹丢失
+    # 3. 包裹丢失
     st.subheader("📦 包裹丢失分析")
     mp = summary["missing_package"]
     mpa, mpb, mpc, mpd = st.columns(4)
@@ -1502,14 +1708,18 @@ else:
 
             1. **⏱️ 客诉响应时效** — 退款处理周期分桶（< 6小时 / 6-24小时 / 1-3天 / 3-7天 / >7天）
             2. **🔁 重复退货买家 TOP 10** — 高频退货者（≥3次自动标记关注，≥5重点监控，≥8建议拉黑）
-            3. **💬 差评关键词 TOP 10** — 从 Buyer Note 抽取，含重要短语（"wrong size", "doesn't fit" 等）
-            4. **📦 包裹丢失分析** — Missing package 的趋势 + 高发款式
-            5. **📈 产品生命周期退货率** — 新品/成长/成熟/长尾期分组对比
+            3. **📦 包裹丢失分析** — Missing package 的趋势 + 高发款式
+            4. **📈 产品生命周期退货率** — 新品/成长/成熟/长尾期分组对比
 
             **供应商分析升级**
 
             从「只看问题款占比」→ **按厂家聚合所有在售款的整体退货率**：
             - 在售款数 / 有销量款数 / 总销量 / 总退货 / 整体退货率 / 代表问题款
             - 不再被供应商体量误导（PONY 量大不代表退货率高）
+
+            **数据可视化**
+
+            周报 Excel 内嵌入 10 张图表：销量 TOP 10、退货率 TOP 10、退货原因（条形+环形）、
+            供应商退货率、响应时效、生命周期、SKU 数量结构、退货原因 WoW 对比、供应商销量vs退货
             """
         )
